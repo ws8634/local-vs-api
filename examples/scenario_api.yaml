@@ -1,0 +1,10 @@
+scenario_name: 营销内容生成
+daily_requests: 10000
+avg_input_tokens: 50
+avg_output_tokens: 300
+allow_external_network: true
+latency_constraint_p95_ms: 5000.0
+needs_finetuning: false
+needs_strict_output_schema: false
+primary_inference_path: "api"
+api_pricing_model: "gpt_35_turbo"

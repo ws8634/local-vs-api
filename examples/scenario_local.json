@@ -1,0 +1,13 @@
+{
+  "scenario_name": "内部客服机器人",
+  "daily_requests": 5000,
+  "avg_input_tokens": 200,
+  "avg_output_tokens": 150,
+  "allow_external_network": true,
+  "latency_constraint_p95_ms": 2000.0,
+  "needs_finetuning": true,
+  "needs_strict_output_schema": true,
+  "primary_inference_path": "local",
+  "data_leaves_premises_local": false,
+  "third_party_logging_local": false
+}
