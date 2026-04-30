@@ -2,7 +2,7 @@
 数据模型定义和校验逻辑
 """
 from typing import Optional, Dict, Any, List
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 
 from pydantic import (
@@ -19,6 +19,13 @@ from llm_selection.constants import PrivacyLevel
 class PrimaryInferencePath(str, Enum):
     LOCAL = "local"
     API = "api"
+
+
+class LatencyConstraintCheck(BaseModel):
+    constraint_p95_ms: Optional[float] = Field(description="用户设置的P95延迟约束")
+    estimated_p95_ms: float = Field(description="估算的P95延迟")
+    violates_constraint: bool = Field(description="是否违反延迟约束")
+    margin_ms: float = Field(description="与约束的差值（正值表示未违反，负值表示违反）")
 
 
 class CostBreakdownLocal(BaseModel):
@@ -40,8 +47,8 @@ class CostBreakdownAPI(BaseModel):
 
 
 class CostResult(BaseModel):
-    local: Optional[CostBreakdownLocal] = None
-    api: Optional[CostBreakdownAPI] = None
+    local: CostBreakdownLocal = Field(description="本地部署月度成本分解")
+    api: CostBreakdownAPI = Field(description="API部署月度成本分解")
 
 
 class PrivacyFactors(BaseModel):
@@ -61,12 +68,15 @@ class PrivacyResult(BaseModel):
 class LatencyBreakdown(BaseModel):
     mean_latency_ms: float = Field(description="平均延迟(ms)")
     p95_latency_ms: float = Field(description="P95延迟(ms)")
+    constraint_check: Optional[LatencyConstraintCheck] = Field(
+        default=None, description="与用户设置的P95约束的对比检查"
+    )
     assumptions: Dict[str, Any] = Field(description="假设参数说明")
 
 
 class LatencyResult(BaseModel):
-    local: Optional[LatencyBreakdown] = None
-    api: Optional[LatencyBreakdown] = None
+    local: LatencyBreakdown = Field(description="本地部署延迟估算")
+    api: LatencyBreakdown = Field(description="API部署延迟估算")
 
 
 class CustomizationFactors(BaseModel):
@@ -90,7 +100,12 @@ class CustomizationResult(BaseModel):
 
 class ComparisonResult(BaseModel):
     scenario_name: str
-    timestamp: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    primary_inference_path: PrimaryInferencePath = Field(
+        description="用户指定的主推理路径，用于摘要高亮或推荐结论"
+    )
+    timestamp: str = Field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
     cost: CostResult
     privacy: PrivacyResult
     latency: LatencyResult
@@ -102,8 +117,26 @@ class ComparisonResult(BaseModel):
             "examples": [
                 {
                     "scenario_name": "example",
-                    "timestamp": "2026-04-30T12:00:00",
-                    "cost": {},
+                    "primary_inference_path": "local",
+                    "timestamp": "2026-04-30T12:00:00+00:00",
+                    "cost": {
+                        "local": {
+                            "hardware_amortization_monthly": 800.0,
+                            "power_cost_monthly": 69.12,
+                            "total_monthly": 869.12,
+                            "hardware_tier": "mid_gpu",
+                            "assumptions": {}
+                        },
+                        "api": {
+                            "input_tokens_daily": 1000000,
+                            "output_tokens_daily": 500000,
+                            "input_cost_monthly": 45.0,
+                            "output_cost_monthly": 30.0,
+                            "total_monthly": 75.0,
+                            "pricing_model": "gpt_35_turbo",
+                            "assumptions": {}
+                        }
+                    },
                     "privacy": {},
                     "latency": {},
                     "customization": {},
@@ -115,26 +148,20 @@ class ComparisonResult(BaseModel):
 
 
 class ScenarioConfig(BaseModel):
-    scenario_name: str = Field(..., min_length=1, description="场景名称")
+    scenario_name: str = Field(description="场景名称")
     
-    daily_requests: int = Field(
-        ..., gt=0, description="日均请求量量级"
-    )
+    daily_requests: int = Field(description="日均请求量量级")
     
-    avg_input_tokens: int = Field(
-        ..., ge=0, description="单次平均输入token数量"
-    )
+    avg_input_tokens: int = Field(description="单次平均输入token数量")
     
-    avg_output_tokens: int = Field(
-        ..., ge=0, description="单次平均输出token数量"
-    )
+    avg_output_tokens: int = Field(description="单次平均输出token数量")
     
     allow_external_network: bool = Field(
-        ..., description="是否允许连接外网"
+        description="是否允许连接外网"
     )
     
     latency_constraint_p95_ms: Optional[float] = Field(
-        default=None, gt=0, description="可接受的P95延迟约束(毫秒)"
+        default=None, description="可接受的P95延迟约束(毫秒)"
     )
     
     needs_finetuning: bool = Field(
@@ -146,7 +173,7 @@ class ScenarioConfig(BaseModel):
     )
     
     primary_inference_path: PrimaryInferencePath = Field(
-        ..., description="主推理路径: local 或 api"
+        description="主推理路径: local 或 api（仅用于摘要高亮，不影响两侧数据计算）"
     )
     
     data_leaves_premises_local: bool = Field(
@@ -165,6 +192,13 @@ class ScenarioConfig(BaseModel):
         default=None, description="自定义API定价: {input_per_1k_tokens, output_per_1k_tokens}"
     )
     
+    @field_validator("scenario_name")
+    @classmethod
+    def validate_scenario_name(cls, v: str) -> str:
+        if not v or len(v.strip()) == 0:
+            raise ValueError("场景名称不能为空")
+        return v
+    
     @field_validator("avg_input_tokens", "avg_output_tokens")
     @classmethod
     def validate_non_negative_tokens(cls, v: int, info: ValidationInfo) -> int:
@@ -177,6 +211,13 @@ class ScenarioConfig(BaseModel):
     def validate_positive_requests(cls, v: int) -> int:
         if v <= 0:
             raise ValueError("日均请求量必须大于0")
+        return v
+    
+    @field_validator("latency_constraint_p95_ms")
+    @classmethod
+    def validate_latency_constraint(cls, v: Optional[float]) -> Optional[float]:
+        if v is not None and v <= 0:
+            raise ValueError("延迟约束必须大于0")
         return v
     
     @model_validator(mode="after")

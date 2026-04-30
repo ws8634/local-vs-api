@@ -14,6 +14,7 @@ from llm_selection.models import (
     PrivacyFactors,
     LatencyResult,
     LatencyBreakdown,
+    LatencyConstraintCheck,
     CustomizationResult,
     CustomizationScore,
     CustomizationFactors,
@@ -31,10 +32,7 @@ from llm_selection.constants import (
 )
 
 
-def calculate_cost_local(config: ScenarioConfig) -> Optional[CostBreakdownLocal]:
-    if config.primary_inference_path == PrimaryInferencePath.API:
-        return None
-    
+def calculate_cost_local(config: ScenarioConfig) -> CostBreakdownLocal:
     daily_requests = config.daily_requests
     
     selected_tier = None
@@ -74,10 +72,7 @@ def calculate_cost_local(config: ScenarioConfig) -> Optional[CostBreakdownLocal]
     )
 
 
-def calculate_cost_api(config: ScenarioConfig) -> Optional[CostBreakdownAPI]:
-    if config.primary_inference_path == PrimaryInferencePath.LOCAL:
-        return None
-    
+def calculate_cost_api(config: ScenarioConfig) -> CostBreakdownAPI:
     input_tokens_daily = config.daily_requests * config.avg_input_tokens
     output_tokens_daily = config.daily_requests * config.avg_output_tokens
     
@@ -119,6 +114,24 @@ def calculate_cost(config: ScenarioConfig) -> CostResult:
     return CostResult(
         local=calculate_cost_local(config),
         api=calculate_cost_api(config),
+    )
+
+
+def build_latency_constraint_check(
+    constraint_p95_ms: Optional[float],
+    estimated_p95_ms: float,
+) -> Optional[LatencyConstraintCheck]:
+    if constraint_p95_ms is None:
+        return None
+    
+    margin_ms = constraint_p95_ms - estimated_p95_ms
+    violates_constraint = estimated_p95_ms > constraint_p95_ms
+    
+    return LatencyConstraintCheck(
+        constraint_p95_ms=constraint_p95_ms,
+        estimated_p95_ms=estimated_p95_ms,
+        violates_constraint=violates_constraint,
+        margin_ms=round(margin_ms, 2),
     )
 
 
@@ -174,54 +187,57 @@ def calculate_privacy(config: ScenarioConfig) -> PrivacyResult:
 
 def calculate_latency(config: ScenarioConfig) -> LatencyResult:
     total_tokens_per_request = config.avg_input_tokens + config.avg_output_tokens
+    constraint = config.latency_constraint_p95_ms
     
-    local_breakdown: Optional[LatencyBreakdown] = None
-    if config.primary_inference_path == PrimaryInferencePath.LOCAL:
-        local_assumptions = LATENCY_ASSUMPTIONS["local"]
-        mean_per_token = local_assumptions["mean_per_token_ms"]
-        p95_multiplier = local_assumptions["p95_multiplier"]
-        
-        mean_latency = total_tokens_per_request * mean_per_token
-        p95_latency = mean_latency * p95_multiplier
-        
-        local_breakdown = LatencyBreakdown(
-            mean_latency_ms=round(mean_latency, 2),
-            p95_latency_ms=round(p95_latency, 2),
-            assumptions={
-                "mean_per_token_ms": mean_per_token,
-                "p95_multiplier": p95_multiplier,
-                "total_tokens_per_request": total_tokens_per_request,
-                "is_assumption": True,
-                "note": "本地延迟基于每token处理时间估算，不考虑网络开销",
-            },
-        )
+    local_assumptions = LATENCY_ASSUMPTIONS["local"]
+    mean_per_token_local = local_assumptions["mean_per_token_ms"]
+    p95_multiplier_local = local_assumptions["p95_multiplier"]
     
-    api_breakdown: Optional[LatencyBreakdown] = None
-    if config.primary_inference_path == PrimaryInferencePath.API:
-        api_assumptions = LATENCY_ASSUMPTIONS["api"]
-        rtt = api_assumptions["rtt_ms"]
-        queue_wait = api_assumptions["queue_wait_ms"]
-        mean_per_token = api_assumptions["mean_per_token_ms"]
-        p95_multiplier = api_assumptions["p95_multiplier"]
-        
-        base_overhead = rtt + queue_wait
-        token_processing = total_tokens_per_request * mean_per_token
-        mean_latency = base_overhead + token_processing
-        p95_latency = base_overhead + (token_processing * p95_multiplier)
-        
-        api_breakdown = LatencyBreakdown(
-            mean_latency_ms=round(mean_latency, 2),
-            p95_latency_ms=round(p95_latency, 2),
-            assumptions={
-                "rtt_ms": rtt,
-                "queue_wait_ms": queue_wait,
-                "mean_per_token_ms": mean_per_token,
-                "p95_multiplier": p95_multiplier,
-                "total_tokens_per_request": total_tokens_per_request,
-                "is_assumption": True,
-                "note": "API延迟包含网络往返时间、排队等待和token处理时间",
-            },
-        )
+    mean_latency_local = total_tokens_per_request * mean_per_token_local
+    p95_latency_local = mean_latency_local * p95_multiplier_local
+    
+    local_breakdown = LatencyBreakdown(
+        mean_latency_ms=round(mean_latency_local, 2),
+        p95_latency_ms=round(p95_latency_local, 2),
+        constraint_check=build_latency_constraint_check(
+            constraint, p95_latency_local
+        ),
+        assumptions={
+            "mean_per_token_ms": mean_per_token_local,
+            "p95_multiplier": p95_multiplier_local,
+            "total_tokens_per_request": total_tokens_per_request,
+            "is_assumption": True,
+            "note": "本地延迟基于每token处理时间估算，不考虑网络开销",
+        },
+    )
+    
+    api_assumptions = LATENCY_ASSUMPTIONS["api"]
+    rtt = api_assumptions["rtt_ms"]
+    queue_wait = api_assumptions["queue_wait_ms"]
+    mean_per_token_api = api_assumptions["mean_per_token_ms"]
+    p95_multiplier_api = api_assumptions["p95_multiplier"]
+    
+    base_overhead = rtt + queue_wait
+    token_processing = total_tokens_per_request * mean_per_token_api
+    mean_latency_api = base_overhead + token_processing
+    p95_latency_api = base_overhead + (token_processing * p95_multiplier_api)
+    
+    api_breakdown = LatencyBreakdown(
+        mean_latency_ms=round(mean_latency_api, 2),
+        p95_latency_ms=round(p95_latency_api, 2),
+        constraint_check=build_latency_constraint_check(
+            constraint, p95_latency_api
+        ),
+        assumptions={
+            "rtt_ms": rtt,
+            "queue_wait_ms": queue_wait,
+            "mean_per_token_ms": mean_per_token_api,
+            "p95_multiplier": p95_multiplier_api,
+            "total_tokens_per_request": total_tokens_per_request,
+            "is_assumption": True,
+            "note": "API延迟包含网络往返时间、排队等待和token处理时间",
+        },
+    )
     
     return LatencyResult(
         local=local_breakdown,
@@ -287,6 +303,7 @@ def calculate_customization(config: ScenarioConfig) -> CustomizationResult:
 def run_comparison(config: ScenarioConfig) -> ComparisonResult:
     return ComparisonResult(
         scenario_name=config.scenario_name,
+        primary_inference_path=config.primary_inference_path,
         cost=calculate_cost(config),
         privacy=calculate_privacy(config),
         latency=calculate_latency(config),
